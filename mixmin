@@ -1,0 +1,115 @@
+module.exports.parse = async ({ content }, { notify }) => {
+  const webshare = {
+    name: "WebShare-Proxy",
+    type: "http",
+    server: "138.226.61.228",
+    port: 6401,
+    username: "odcrklvu",
+    password: "atoiz9csk0tc",
+  };
+
+  const upsertByName = (arr, item) => {
+    const i = arr.findIndex((x) => x && x.name === item.name);
+    if (i >= 0) arr[i] = { ...arr[i], ...item };
+    else arr.push(item);
+  };
+
+  const upsertGroup = (groups, g) => {
+    const idx = groups.findIndex((x) => x && x.name === g.name);
+    if (idx >= 0) {
+      const old = groups[idx];
+
+      // relay 的 proxies 顺序很重要：强制覆盖
+      const proxies =
+        String(g.type).toLowerCase() === "relay"
+          ? (g.proxies || [])
+          : Array.from(new Set([...(old.proxies || []), ...(g.proxies || [])]));
+
+      groups[idx] = { ...old, ...g, proxies };
+    } else {
+      groups.push(g);
+    }
+  };
+
+  const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
+
+  // 1) 注入 WebShare-Proxy
+  content.proxies = Array.isArray(content.proxies) ? content.proxies : [];
+  upsertByName(content.proxies, webshare);
+
+  // 2) 找出所有“香港”节点
+  const hkProxyNames = content.proxies
+    .filter(
+      (p) =>
+        p &&
+        typeof p.name === "string" &&
+        p.name.includes("香港") &&
+        p.name !== webshare.name
+    )
+    .map((p) => p.name);
+
+  // 3) 为每个香港节点生成 relay： [原节点, WebShare-Proxy]
+  const hkRelayGroups = hkProxyNames.map((name) => ({
+    name: `${name}+WebShare`,
+    type: "relay",
+    proxies: [name, webshare.name],
+  }));
+
+  // 4) 香港总选择组（可选，但很方便）
+  const hkSelectGroup =
+    hkRelayGroups.length > 0
+      ? {
+          name: "🇭🇰HK丨香港+WebShare",
+          type: "select",
+          proxies: hkRelayGroups.map((g) => g.name),
+        }
+      : null;
+
+  // 5) 合并 proxy-groups：注入 HK relay / HK 总组 / Proxy-Chain
+  content["proxy-groups"] = Array.isArray(content["proxy-groups"])
+    ? content["proxy-groups"]
+    : [];
+
+  for (const g of hkRelayGroups) upsertGroup(content["proxy-groups"], g);
+  if (hkSelectGroup) upsertGroup(content["proxy-groups"], hkSelectGroup);
+
+  const proxyChain = {
+    name: "Proxy-Chain",
+    type: "select",
+    proxies: uniq(["DIRECT", ...(hkSelectGroup ? [hkSelectGroup.name] : [])]),
+  };
+  upsertGroup(content["proxy-groups"], proxyChain);
+
+  // 6) 把所有非 relay 的 proxy-group 里出现的“香港节点”替换成 “香港节点+WebShare”
+  const hkMap = Object.fromEntries(
+    hkProxyNames.map((n) => [n, `${n}+WebShare`])
+  );
+
+  for (const g of content["proxy-groups"]) {
+    if (!g || !Array.isArray(g.proxies)) continue;
+    if (String(g.type).toLowerCase() === "relay") continue; // 避免嵌套 relay
+
+    g.proxies = uniq(g.proxies.map((p) => hkMap[p] || p));
+  }
+
+  // 7) rules：确保最后只有一个兜底 MATCH,Proxy-Chain
+  const finalRule = "MATCH,Proxy-Chain";
+  content.rules = Array.isArray(content.rules) ? content.rules : [];
+
+  content.rules = content.rules.filter(
+    (r) => !(typeof r === "string" && r.trim().toUpperCase().startsWith("MATCH,"))
+  );
+
+  if (!content.rules.includes(finalRule)) content.rules.push(finalRule);
+
+  notify &&
+    notify(
+      "Mixin",
+      hkProxyNames.length
+        ? `已注入 WebShare，并将“香港”节点替换为 +WebShare relay（共 ${hkProxyNames.length} 个），追加 MATCH,Proxy-Chain`
+        : "已注入 WebShare / Proxy-Chain，并追加 MATCH,Proxy-Chain（未检测到包含“香港”的节点）",
+      true
+    );
+
+  return content;
+};
